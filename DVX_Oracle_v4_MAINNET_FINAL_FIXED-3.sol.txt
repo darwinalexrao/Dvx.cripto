@@ -1,0 +1,703 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * ██████╗ ██╗   ██╗██╗  ██╗  ██████╗ ██████╗  █████╗  ██████╗██╗     ███████╗
+ * ██╔══██╗██║   ██║╚██╗██╔╝ ██╔═══██╗██╔══██╗██╔══██╗██╔════╝██║     ██╔════╝
+ * ██║  ██║██║   ██║ ╚███╔╝  ██║   ██║██████╔╝███████║██║     ██║     █████╗
+ * ██║  ██║╚██╗ ██╔╝ ██╔██╗  ██║   ██║██╔══██╗██╔══██║██║     ██║     ██╔══╝
+ * ██████╔╝ ╚████╔╝ ██╔╝ ██╗ ╚██████╔╝██║  ██║██║  ██║╚██████╗███████╗███████╗
+ * ╚═════╝   ╚═══╝  ╚═╝  ╚═╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚══════╝
+ *
+ * @title   DVX Data Oracle v4.0 — BSC Mainnet FINAL
+ * @author  DVX Team
+ * @notice  Production-ready Chainlink Any-API Oracle for BSC Mainnet.
+ *          Fetches Global Export-Import Index daily and pushes to DVX Token.
+ *
+ * ─── BSC MAINNET ADDRESSES ───────────────────────────────────────────────────
+ *   LINK Token  : 0x404460C6A5EdE2D891e8297795264fDe62ADBB75
+ *   LINK Fee    : 100000000000000000 (0.1 LINK = 1e17 wei)
+ *
+ * ─── BSC TESTNET ADDRESSES (for testing first) ───────────────────────────────
+ *   LINK Token  : 0x84b9B910527Ad5C03A9Ca831909E21e236EA7b06
+ *
+ * ─── DEPLOYMENT ORDER ────────────────────────────────────────────────────────
+ *   1. Deploy DVXDataOracle(linkToken, oracleNode, jobId, altJobId, linkFee, guardian)
+ *   2. Deploy DVXToken(communityWallet, reserveWallet, oracleAddress)
+ *   3. DVXDataOracle.linkDVXContract(tokenAddress)
+ *   4. Send minimum 2 LINK to DVXDataOracle address
+ *   5. DVXDataOracle.fetchGlobalData()    ← first fetch
+ *   6. DVXToken.setOracleEnabled(true)    ← enable oracle-driven fees
+ *
+ * ─── v4.0 FEATURES ──────────────────────────────────────────────────────────
+ *   [F-1]  Proper CBOR encoding for Chainlink Any-API (RFC 7049)
+ *   [F-2]  Correct Chainlink request format (oracleRequest selector 0x40429946)
+ *   [F-3]  Configurable API endpoints — update without redeploying
+ *   [F-4]  Three API sources: Primary (World Bank), Alt (UN Comtrade), Emergency
+ *   [F-5]  Auto-pause after N consecutive failures (default: 10)
+ *   [F-6]  Emergency static mode — guardian sets fixed index without developer
+ *   [F-7]  Dual-control: owner + guardian for critical operations
+ *   [F-8]  Adjustable push gas limit (100k–500k, default 250k)
+ *   [F-9]  5-point moving average smoothing (prevents single-spike fee shocks)
+ *   [F-10] Duplicate request protection — one request at a time
+ *   [F-11] Low LINK balance warning events
+ *   [F-12] Complete status view for dashboard/monitoring
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+// =============================================================================
+//  SECTION 1: CBOR ENCODING LIBRARY
+//  Required for Chainlink Any-API requests (RFC 7049 CBOR format).
+//  Without proper CBOR, Chainlink node cannot decode the request parameters.
+// =============================================================================
+
+library CBORLib {
+    /**
+     * @notice Encode a 3-param Chainlink Any-API request in CBOR format
+     * @dev    map(3){ "get":url, "path":jsonPath, "times":multiplier }
+     *         This is the exact format Chainlink Operator.sol expects.
+     * @param  getUrl    HTTP GET URL of the API endpoint
+     * @param  jsonPath  Comma-separated JSON path (e.g. "1,0,value")
+     * @param  times     Integer multiplier to convert float → integer
+     * @return CBOR-encoded bytes ready for Chainlink transferAndCall
+     */
+    function encodeRequest(
+        string memory getUrl,
+        string memory jsonPath,
+        uint256 times
+    ) internal pure returns (bytes memory) {
+        return abi.encodePacked(
+            hex"a3",                   // CBOR map with 3 entries
+            _encodeString("get"),      // key
+            _encodeString(getUrl),     // value: API URL
+            _encodeString("path"),     // key
+            _encodeString(jsonPath),   // value: JSON path
+            _encodeString("times"),    // key
+            _encodeUint(times)         // value: multiplier
+        );
+    }
+
+    /// @dev Encode UTF-8 string as CBOR text (major type 3)
+    function _encodeString(string memory s) private pure returns (bytes memory) {
+        bytes memory b   = bytes(s);
+        uint256      len = b.length;
+        if (len <= 23)  return abi.encodePacked(bytes1(uint8(0x60 | len)), b);
+        if (len <= 255) return abi.encodePacked(bytes1(0x78), bytes1(uint8(len)), b);
+        return abi.encodePacked(bytes1(0x79), bytes2(uint16(len)), b);
+    }
+
+    /// @dev Encode non-negative integer as CBOR unsigned int (major type 0)
+    function _encodeUint(uint256 v) private pure returns (bytes memory) {
+        if (v <= 23)         return abi.encodePacked(bytes1(uint8(v)));
+        if (v <= 0xFF)       return abi.encodePacked(bytes1(0x18), bytes1(uint8(v)));
+        if (v <= 0xFFFF)     return abi.encodePacked(bytes1(0x19), bytes2(uint16(v)));
+        if (v <= 0xFFFFFFFF) return abi.encodePacked(bytes1(0x1a), bytes4(uint32(v)));
+        return abi.encodePacked(bytes1(0x1b), bytes8(uint64(v)));
+    }
+}
+
+// =============================================================================
+//  SECTION 2: INTERFACES
+// =============================================================================
+
+/// @notice Chainlink LINK Token (BSC)
+interface ILinkToken {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 value) external returns (bool);
+    function transferAndCall(
+        address to,
+        uint256 value,
+        bytes calldata data
+    ) external returns (bool);
+}
+
+/// @notice DVX Token callback interface
+interface IDVXCallback {
+    function onOracleUpdate(uint256 exportIndex) external;
+}
+
+// =============================================================================
+//  SECTION 3: DVX DATA ORACLE v4.0
+// =============================================================================
+
+contract DVXDataOracle {
+
+    // ─── CHAINLINK CONSTANTS ──────────────────────────────────────────────────
+
+    /// @dev oracleRequest() selector on Chainlink Operator.sol
+    ///      bytes4(keccak256("oracleRequest(address,uint256,bytes32,address,bytes4,uint256,uint256,bytes)"))
+    bytes4  private constant ORACLE_REQUEST_SELECTOR = 0x40429946;
+    address private constant SENDER_OVERRIDE         = address(1);
+    uint256 private constant AMOUNT_OVERRIDE         = 0;
+    uint256 private constant DATA_VERSION            = 1;
+
+    // ─── CONFIGURATION BOUNDS ─────────────────────────────────────────────────
+    uint256 public constant MIN_FETCH_INTERVAL = 1 hours;
+    uint256 public constant MAX_FETCH_INTERVAL = 7 days;
+    uint256 public constant PUSH_GAS_MIN       = 100_000;
+    uint256 public constant PUSH_GAS_MAX       = 500_000;
+    uint256 public constant MIN_LINK_WARNING   = 1 ether; // 1 LINK
+
+    // ─── STATE: ORACLE DATA ───────────────────────────────────────────────────
+    uint256 public globalExportIndex = 3000; // Default: 30.00 (basis points, 5000=50%)
+    uint256[5] public exportHistory;         // 5-slot circular buffer
+    uint8   public historySlot;              // Current write position
+    uint8   public historyCount;             // How many slots filled (0–5)
+    uint256 public lastUpdatedAt;
+    uint256 public totalFetches;
+    uint256 public totalFulfills;
+    uint256 public consecutiveFailures;
+
+    // ─── STATE: CHAINLINK ─────────────────────────────────────────────────────
+    address private linkToken;
+    address private oracleNode;   // Chainlink Operator contract
+    bytes32 private jobId;        // Primary job spec ID
+    bytes32 private altJobId;     // Alternate/backup job spec ID
+    uint256 private linkFee;      // Fee per request (e.g. 0.1 LINK = 1e17)
+    uint256 public  requestNonce; // Monotonically increasing, used in requestId
+
+    mapping(bytes32 => address) private pendingRequests; // requestId → oracleNode
+    bytes32 public activePendingRequest;                  // Zero if none pending
+
+    // ─── STATE: API ENDPOINTS [F-3][F-4] ─────────────────────────────────────
+    string  public primaryUrl;
+    string  public primaryPath;
+    uint256 public primaryTimes;
+
+    string  public altUrl;
+    string  public altPath;
+    uint256 public altTimes;
+
+    string  public emergencyUrl;
+    string  public emergencyPath;
+    uint256 public emergencyTimes;
+    bool    public emergencyApiEnabled;
+
+    // ─── STATE: CONTROLS ──────────────────────────────────────────────────────
+    address public owner;
+    address public guardian;
+    address public dvxToken;
+    uint256 public minFetchInterval = 24 hours;
+    uint256 public pushGasLimit     = 250_000;
+    uint256 public maxFailures      = 10;   // [F-5] Auto-pause threshold
+    bool    public paused;
+    bool    public staticMode;              // [F-6] Emergency static mode
+    uint256 public staticValue;
+
+    // ─── EVENTS ───────────────────────────────────────────────────────────────
+    event FetchRequested(bytes32 indexed requestId, uint8 sourceUsed, uint256 timestamp);
+    event FetchFulfilled(bytes32 indexed requestId, uint256 rawValue, uint256 smoothed, uint256 timestamp);
+    event FetchFailed(bytes32 indexed requestId, uint256 failureCount);
+    event AutoPaused(uint256 failures, uint256 timestamp);
+    event ManualIndexSet(uint256 value, address indexed by);
+    event StaticModeSet(bool active, uint256 value, address indexed by);
+    event DVXTokenLinked(address indexed token);
+    event OracleConfigUpdated(address indexed node, bytes32 jobId, uint256 fee);
+    event AltJobUpdated(bytes32 altJobId);
+    event PrimaryEndpointUpdated(string url, string path, uint256 times);
+    event AltEndpointUpdated(string url, string path, uint256 times);
+    event EmergencyEndpointUpdated(string url, string path, uint256 times, bool enabled);
+    event FetchIntervalUpdated(uint256 newInterval);
+    event PushGasUpdated(uint256 newGas);
+    event MaxFailuresUpdated(uint256 newMax);
+    event OraclePaused(bool isPaused, string reason);
+    event GuardianUpdated(address indexed oldGuardian, address indexed newGuardian);
+    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+    event LinkWithdrawn(address indexed to, uint256 amount);
+    event LowLinkWarning(uint256 balance);
+    event PushResult(address indexed token, bool success, uint256 gasUsed);
+    event FailureCountReset(address indexed by);
+
+    // ─── ERRORS ───────────────────────────────────────────────────────────────
+    error NotOwner();
+    error NotOwnerOrGuardian();
+    error OraclePausedErr();
+    error TooSoon(uint256 nextAt);
+    error PendingExists();
+    error NoLink();
+    error NotOracle();
+    error UnknownRequest();
+    error ZeroAddr();
+    error BadValue();
+    error GasOutOfRange(uint256 min, uint256 max);
+    error EmptyString();
+
+    // ─── MODIFIERS ────────────────────────────────────────────────────────────
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert NotOwner();
+        _;
+    }
+
+    modifier onlyOwnerOrGuardian() {
+        if (msg.sender != owner && msg.sender != guardian) revert NotOwnerOrGuardian();
+        _;
+    }
+
+    modifier notPaused() {
+        if (paused) revert OraclePausedErr();
+        _;
+    }
+
+    /// @dev Chainlink callback security: verify requestId + caller
+    modifier onlyPendingRequest(bytes32 requestId) {
+        address expected = pendingRequests[requestId];
+        if (expected == address(0))    revert UnknownRequest();
+        if (msg.sender != expected)    revert NotOracle();
+        _;
+        delete pendingRequests[requestId];
+        if (activePendingRequest == requestId) {
+            activePendingRequest = bytes32(0);
+        }
+    }
+
+    // ─── CONSTRUCTOR ──────────────────────────────────────────────────────────
+
+    /**
+     * @param _linkToken   BSC LINK token address
+     * @param _oracleNode  Chainlink Operator contract address
+     * @param _jobId       Primary Any-API Job ID (bytes32)
+     * @param _altJobId    Alternate Job ID (bytes32, can be 0)
+     * @param _linkFee     Fee per request (0.1 LINK = 100000000000000000)
+     * @param _guardian    Guardian address for dual-control
+     */
+    constructor(
+        address _linkToken,
+        address _oracleNode,
+        bytes32 _jobId,
+        bytes32 _altJobId,
+        uint256 _linkFee,
+        address _guardian
+    ) {
+        if (_linkToken  == address(0)) revert ZeroAddr();
+        if (_oracleNode == address(0)) revert ZeroAddr();
+        if (_guardian   == address(0)) revert ZeroAddr();
+        if (_linkFee    == 0)          revert BadValue();
+
+        owner      = msg.sender;
+        guardian   = _guardian;
+        linkToken  = _linkToken;
+        oracleNode = _oracleNode;
+        jobId      = _jobId;
+        altJobId   = _altJobId;
+        linkFee    = _linkFee;
+
+        // Allow immediate first fetch
+        lastUpdatedAt = block.timestamp - 25 hours;
+
+        // Default API endpoints
+        primaryUrl   = "https://api.worldbank.org/v2/indicator/TX.VAL.MRCH.XD.WD?format=json&mrv=1&per_page=1";
+        primaryPath  = "1,0,value";
+        primaryTimes = 100;
+
+        altUrl   = "https://comtradeapi.un.org/public/v1/preview/C/A/HS?typeCode=C&freqCode=A&clCode=HS&period=recent&reporterCode=0&cmdCode=TOTAL&flowCode=X&partnerCode=0&partner2Code=0&customsCode=C00&motCode=0&maxRecords=1&format=JSON";
+        altPath  = "data,0,primaryValue";
+        altTimes = 1;
+
+        emergencyTimes      = 100;
+        emergencyApiEnabled = false;
+
+        // Seed history with neutral value
+        for (uint8 i = 0; i < 5; i++) exportHistory[i] = 3000;
+        historyCount = 5;
+    }
+
+    // ─── CORE: REQUEST DATA ───────────────────────────────────────────────────
+
+    /**
+     * @notice Trigger a new data fetch from Chainlink
+     * @dev    Selects API source based on consecutive failure count:
+     *           0–2 failures  → Primary (World Bank)
+     *           3–6 failures  → Alt (UN Comtrade, if altJobId set)
+     *           7+ failures   → Emergency (if emergencyApiEnabled)
+     *           10+ failures  → Auto-pause [F-5]
+     * @return requestId The Chainlink request ID
+     */
+    function fetchGlobalData() external notPaused returns (bytes32 requestId) {
+        // Interval check
+        if (block.timestamp < lastUpdatedAt + minFetchInterval) {
+            revert TooSoon(lastUpdatedAt + minFetchInterval);
+        }
+
+        // One request at a time [F-10]
+        if (activePendingRequest != bytes32(0)) revert PendingExists();
+
+        // LINK balance check
+        uint256 linkBal = ILinkToken(linkToken).balanceOf(address(this));
+        if (linkBal < linkFee) revert NoLink();
+        if (linkBal < MIN_LINK_WARNING) emit LowLinkWarning(linkBal);
+
+        // Select API source and job ID
+        uint8   sourceUsed;
+        bytes32 activeJob;
+        string  memory url;
+        string  memory path;
+        uint256 times;
+
+        if (consecutiveFailures >= 7 && emergencyApiEnabled && bytes(emergencyUrl).length > 0) {
+            sourceUsed = 2;
+            activeJob  = (altJobId != bytes32(0)) ? altJobId : jobId;
+            url        = emergencyUrl;
+            path       = emergencyPath;
+            times      = emergencyTimes;
+        } else if (consecutiveFailures >= 3 && altJobId != bytes32(0)) {
+            sourceUsed = 1;
+            activeJob  = altJobId;
+            url        = altUrl;
+            path       = altPath;
+            times      = altTimes;
+        } else {
+            sourceUsed = 0;
+            activeJob  = jobId;
+            url        = primaryUrl;
+            path       = primaryPath;
+            times      = primaryTimes;
+        }
+
+        // Build CBOR-encoded request payload [F-1]
+        bytes memory cborPayload = CBORLib.encodeRequest(url, path, times);
+
+        // Compute deterministic requestId matching Chainlink's internal format [F-2]
+        uint256 nonce = ++requestNonce;
+        requestId = keccak256(abi.encodePacked(address(this), nonce));
+
+        // Track pending request
+        pendingRequests[requestId] = oracleNode;
+        activePendingRequest       = requestId;
+        totalFetches++;
+
+        // Build and send Chainlink request via LINK transferAndCall [F-2]
+        bytes memory callPayload = abi.encodeWithSelector(
+            ORACLE_REQUEST_SELECTOR,
+            SENDER_OVERRIDE,           // overridden by LINK contract
+            AMOUNT_OVERRIDE,           // overridden by LINK contract
+            activeJob,                 // Chainlink job/spec ID
+            address(this),             // callback address (this contract)
+            this.fulfill.selector,     // callback function selector
+            nonce,                     // request nonce
+            DATA_VERSION,             // Chainlink data version = 1
+            cborPayload               // CBOR-encoded API parameters
+        );
+
+        ILinkToken(linkToken).transferAndCall(oracleNode, linkFee, callPayload);
+        emit FetchRequested(requestId, sourceUsed, block.timestamp);
+    }
+
+    /**
+     * @notice Chainlink node calls this to deliver the fetched data
+     * @dev    Only the registered oracle node for this requestId can call this.
+     *         onlyPendingRequest modifier: verifies caller + cleans up state.
+     * @param  _requestId  Must match an active pending request
+     * @param  _exportData Raw export index value (basis points, e.g. 5000 = 50.00)
+     */
+    function fulfill(
+        bytes32 _requestId,
+        uint256 _exportData
+    ) external onlyPendingRequest(_requestId) {
+        // Validate data range (0 = API error, 100000+ = impossible)
+        if (_exportData == 0 || _exportData >= 100_000) {
+            consecutiveFailures++;
+            _checkAutoPause();
+            emit FetchFailed(_requestId, consecutiveFailures);
+            return;
+        }
+
+        // Success: reset failures, update state
+        consecutiveFailures = 0;
+        totalFulfills++;
+
+        // Update circular history buffer (5-point moving average)
+        exportHistory[historySlot] = _exportData;
+        historySlot = (historySlot + 1) % 5;
+        if (historyCount < 5) historyCount++;
+
+        globalExportIndex = _exportData;
+        lastUpdatedAt     = block.timestamp;
+
+        uint256 smoothed = getSmoothedIndex();
+        emit FetchFulfilled(_requestId, _exportData, smoothed, block.timestamp);
+
+        // Push to DVX Token [F-8] with adjustable gas cap
+        if (dvxToken != address(0)) {
+            uint256 gasBefore = gasleft();
+            (bool ok, ) = dvxToken.call{gas: pushGasLimit}(
+                abi.encodeWithSelector(IDVXCallback.onOracleUpdate.selector, _exportData)
+            );
+            emit PushResult(dvxToken, ok, gasBefore - gasleft());
+            // Silent fail: oracle should not halt if token callback fails
+        }
+    }
+
+    /// @dev [F-5] Auto-pause when consecutive failures exceed threshold
+    function _checkAutoPause() private {
+        if (!paused && consecutiveFailures >= maxFailures) {
+            paused = true;
+            emit AutoPaused(consecutiveFailures, block.timestamp);
+            emit OraclePaused(true, "Auto-paused: consecutive failures exceeded limit");
+        }
+    }
+
+    // ─── DATA SMOOTHING [F-9] ─────────────────────────────────────────────────
+
+    /**
+     * @notice 5-point moving average of last 5 Export Index readings
+     * @dev    Prevents single bad API response from causing fee shock.
+     * @return Average of up to 5 most recent valid readings
+     */
+    function getSmoothedIndex() public view returns (uint256) {
+        uint8 count = historyCount > 5 ? 5 : historyCount;
+        if (count == 0) return globalExportIndex;
+        uint256 sum = 0;
+        unchecked {
+            for (uint8 i = 0; i < count; i++) sum += exportHistory[i];
+        }
+        return sum / count;
+    }
+
+    /**
+     * @notice Effective index: static value (emergency) or live smoothed value
+     */
+    function getEffectiveIndex() external view returns (uint256) {
+        return staticMode ? staticValue : getSmoothedIndex();
+    }
+
+    // ─── EMERGENCY CONTROLS [F-6] ─────────────────────────────────────────────
+
+    /**
+     * @notice Guardian or owner: set a fixed static index when API is broken
+     * @dev    Token will use this value for fee adjustments until staticMode disabled.
+     * @param  _active  true = enable, false = disable
+     * @param  _value   Fixed index value (basis points, 1–99999)
+     */
+    function setStaticMode(bool _active, uint256 _value) external onlyOwnerOrGuardian {
+        if (_active) {
+            require(_value > 0 && _value < 100_000, "DVXOracle: Value out of range");
+            staticMode  = true;
+            staticValue = _value;
+            // Also update main index so token reads correct value immediately
+            globalExportIndex = _value;
+            lastUpdatedAt     = block.timestamp;
+        } else {
+            staticMode = false;
+        }
+        emit StaticModeSet(_active, _value, msg.sender);
+    }
+
+    /**
+     * @notice Owner manually sets index (testing or emergency override)
+     */
+    function setManualIndex(uint256 _value) external onlyOwner {
+        require(_value > 0 && _value < 100_000, "DVXOracle: Value out of range");
+        globalExportIndex           = _value;
+        lastUpdatedAt               = block.timestamp;
+        exportHistory[historySlot]  = _value;
+        historySlot                 = (historySlot + 1) % 5;
+        if (historyCount < 5) historyCount++;
+        consecutiveFailures = 0;
+        emit ManualIndexSet(_value, msg.sender);
+    }
+
+    // ─── API ENDPOINT CONFIGURATION [F-3] ────────────────────────────────────
+
+    function setPrimaryEndpoint(
+        string calldata _url,
+        string calldata _path,
+        uint256 _times
+    ) external onlyOwner {
+        if (bytes(_url).length  == 0) revert EmptyString();
+        if (bytes(_path).length == 0) revert EmptyString();
+        if (_times == 0)              revert BadValue();
+        primaryUrl   = _url;
+        primaryPath  = _path;
+        primaryTimes = _times;
+        emit PrimaryEndpointUpdated(_url, _path, _times);
+    }
+
+    function setAltEndpoint(
+        string calldata _url,
+        string calldata _path,
+        uint256 _times
+    ) external onlyOwner {
+        if (bytes(_url).length  == 0) revert EmptyString();
+        if (bytes(_path).length == 0) revert EmptyString();
+        if (_times == 0)              revert BadValue();
+        altUrl   = _url;
+        altPath  = _path;
+        altTimes = _times;
+        emit AltEndpointUpdated(_url, _path, _times);
+    }
+
+    function setEmergencyEndpoint(
+        string calldata _url,
+        string calldata _path,
+        uint256 _times,
+        bool    _enabled
+    ) external onlyOwner {
+        if (_enabled) {
+            if (bytes(_url).length  == 0) revert EmptyString();
+            if (bytes(_path).length == 0) revert EmptyString();
+            if (_times == 0)              revert BadValue();
+        }
+        emergencyUrl        = _url;
+        emergencyPath       = _path;
+        emergencyTimes      = _times;
+        emergencyApiEnabled = _enabled;
+        emit EmergencyEndpointUpdated(_url, _path, _times, _enabled);
+    }
+
+    // ─── CHAINLINK CONFIGURATION ──────────────────────────────────────────────
+
+    function updateOracleConfig(
+        address _node,
+        bytes32 _jobId,
+        uint256 _fee
+    ) external onlyOwner {
+        if (_node == address(0)) revert ZeroAddr();
+        if (_fee  == 0)          revert BadValue();
+        oracleNode = _node;
+        jobId      = _jobId;
+        linkFee    = _fee;
+        emit OracleConfigUpdated(_node, _jobId, _fee);
+    }
+
+    function setAltJobId(bytes32 _altJobId) external onlyOwner {
+        altJobId = _altJobId;
+        emit AltJobUpdated(_altJobId);
+    }
+
+    function linkDVXContract(address _token) external onlyOwner {
+        if (_token == address(0)) revert ZeroAddr();
+        dvxToken = _token;
+        emit DVXTokenLinked(_token);
+    }
+
+    function setFetchInterval(uint256 _interval) external onlyOwner {
+        if (_interval < MIN_FETCH_INTERVAL || _interval > MAX_FETCH_INTERVAL) revert BadValue();
+        minFetchInterval = _interval;
+        emit FetchIntervalUpdated(_interval);
+    }
+
+    function setPushGasLimit(uint256 _gas) external onlyOwner {
+        if (_gas < PUSH_GAS_MIN || _gas > PUSH_GAS_MAX) {
+            revert GasOutOfRange(PUSH_GAS_MIN, PUSH_GAS_MAX);
+        }
+        pushGasLimit = _gas;
+        emit PushGasUpdated(_gas);
+    }
+
+    function setMaxFailures(uint256 _max) external onlyOwner {
+        if (_max < 3 || _max > 50) revert BadValue();
+        maxFailures = _max;
+        emit MaxFailuresUpdated(_max);
+    }
+
+    // ─── GUARDIAN & PAUSE ─────────────────────────────────────────────────────
+
+    function setPaused(bool _paused) external onlyOwnerOrGuardian {
+        paused = _paused;
+        emit OraclePaused(_paused, _paused ? "Manually paused" : "Manually unpaused");
+    }
+
+    function resetFailures() external onlyOwnerOrGuardian {
+        consecutiveFailures = 0;
+        emit FailureCountReset(msg.sender);
+    }
+
+    function setGuardian(address _guardian) external onlyOwner {
+        if (_guardian == address(0)) revert ZeroAddr();
+        address old = guardian;
+        guardian    = _guardian;
+        emit GuardianUpdated(old, _guardian);
+    }
+
+    // ─── OWNERSHIP ────────────────────────────────────────────────────────────
+
+    function transferOwnership(address _newOwner) external onlyOwner {
+        if (_newOwner == address(0)) revert ZeroAddr();
+        address old = owner;
+        owner       = _newOwner;
+        emit OwnershipTransferred(old, _newOwner);
+    }
+
+    // ─── TOKEN RECOVERY ───────────────────────────────────────────────────────
+
+    function withdrawLink() external onlyOwner {
+        uint256 bal = ILinkToken(linkToken).balanceOf(address(this));
+        require(bal > 0, "DVXOracle: No LINK balance");
+        bool ok = ILinkToken(linkToken).transfer(owner, bal);
+        require(ok, "DVXOracle: LINK transfer failed");
+        emit LinkWithdrawn(owner, bal);
+    }
+
+    // ─── VIEW FUNCTIONS [F-12] ────────────────────────────────────────────────
+
+    function getFullStatus() external view returns (
+        uint256 currentIndex,
+        uint256 smoothedIndex,
+        uint256 lastUpdate,
+        uint256 dataAge,
+        uint256 nextFetchAllowed,
+        uint256 fetches,
+        uint256 fulfills,
+        uint256 failures,
+        bool    isPaused,
+        bool    isStaticMode,
+        bool    hasPending,
+        uint256 linkBalance,
+        uint256 gasLimit,
+        string  memory marketCondition
+    ) {
+        uint256 smoothed = getSmoothedIndex();
+        string memory cond = smoothed > 5000 ? "BULL"
+                           : smoothed < 2000 ? "BEAR"
+                           : "NEUTRAL";
+        return (
+            globalExportIndex,
+            smoothed,
+            lastUpdatedAt,
+            block.timestamp - lastUpdatedAt,
+            lastUpdatedAt + minFetchInterval,
+            totalFetches,
+            totalFulfills,
+            consecutiveFailures,
+            paused,
+            staticMode,
+            activePendingRequest != bytes32(0),
+            ILinkToken(linkToken).balanceOf(address(this)),
+            pushGasLimit,
+            cond
+        );
+    }
+
+    function canFetch() external view returns (bool ok, string memory reason) {
+        if (paused)
+            return (false, "Paused");
+        if (activePendingRequest != bytes32(0))
+            return (false, "Request already pending");
+        if (block.timestamp < lastUpdatedAt + minFetchInterval)
+            return (false, "Interval not elapsed");
+        if (ILinkToken(linkToken).balanceOf(address(this)) < linkFee)
+            return (false, "Insufficient LINK");
+        return (true, "Ready");
+    }
+
+    function getLinkBalance() external view returns (uint256) {
+        return ILinkToken(linkToken).balanceOf(address(this));
+    }
+
+    function getHistoryReadings() external view returns (uint256[5] memory, uint8 count) {
+        return (exportHistory, historyCount);
+    }
+
+    function getApiConfig() external view returns (
+        string memory pUrl, string memory pPath, uint256 pTimes,
+        string memory aUrl, string memory aPath, uint256 aTimes,
+        bool emgEnabled, string memory eUrl
+    ) {
+        return (
+            primaryUrl, primaryPath, primaryTimes,
+            altUrl, altPath, altTimes,
+            emergencyApiEnabled, emergencyUrl
+        );
+    }
+}
